@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 Create a municipality-level dataset for TK 2025 voting behavior analysis.
 
@@ -7,7 +5,7 @@ This version:
 - Uses only necessary CSV files:
     * Income per region (CBS)
     * Regional core figures (CBS)
-    * Wijk/buurt core figures (CBS) – ONLY for migration counts
+    * Wijk/buurt core figures (CBS) – ONLY for migration percentage
     * Election results TK2025 per gemeente
     * PartyDistribution (to get parties with seats + economic & migration blocs)
 - Computes per gemeente:
@@ -15,13 +13,12 @@ This version:
     * num_households
     * avg_income_household (euros)
     * median_income_household (euros)
-    * pop_migration_background (count, from wijk/buurt)
-    * pct_migration_background (percentage, 0–100)
+    * pct_migration_background (percentage, 0–100; from wijk/buurt internal ratio)
     * per-party vote shares in percent, columns: <PARTY>_share_pct
     * bloc vote shares in percent:
         - econ_<ECON_CATEGORY>_share_pct
         - mig_<MIG_CATEGORY>_share_pct
-    * votes_total (total valid votes used as denominator for shares)
+    * votes_total (total valid votes)
 
 Final output:
     Data/merged_tk2025_dataset.csv
@@ -36,7 +33,9 @@ import numpy as np
 import pandas as pd
 
 
-# helpers
+# -------------------------------
+# Generic helpers
+# -------------------------------
 
 def standardize_gemeente_name(series: pd.Series) -> pd.Series:
     """
@@ -105,7 +104,9 @@ def sanitize_name(s: str) -> str:
     return re.sub(r"_+", "_", s).strip("_")
 
 
+# -------------------------------
 # Dataset loaders
+# -------------------------------
 
 def load_party_meta(path: str) -> pd.DataFrame:
     """
@@ -131,17 +132,10 @@ def load_party_meta(path: str) -> pd.DataFrame:
     if party_col is None:
         raise ValueError(f"Could not find a party column in PartyDistribution.csv. Columns: {cols}")
 
-    # economic/migration may be None in theory, but in your file they exist
     party_meta = pd.DataFrame()
     party_meta["party"] = df[party_col].astype(str)
-    if econ_col is not None:
-        party_meta["economic"] = df[econ_col].astype(str)
-    else:
-        party_meta["economic"] = np.nan
-    if mig_col is not None:
-        party_meta["migration"] = df[mig_col].astype(str)
-    else:
-        party_meta["migration"] = np.nan
+    party_meta["economic"] = df[econ_col].astype(str) if econ_col is not None else np.nan
+    party_meta["migration"] = df[mig_col].astype(str) if mig_col is not None else np.nan
 
     return party_meta
 
@@ -203,45 +197,55 @@ def load_core_population(path: str) -> pd.DataFrame:
 
 def load_wijk_buurt(path: str) -> pd.DataFrame:
     """
-    Load wijk/buurt file and aggregate to gemeente level for migration counts.
+    Load wijk/buurt file and compute *percentage* with migration background per gemeente.
 
-    We explicitly remove:
-    - the NL total row
-    - the gemeente-total rows
+    IMPORTANT:
+    - The raw counts in this file are effectively doubled compared to core population,
+      but both the total population and migration counts are doubled in the same way.
+    - Therefore, the *ratio* migration/total is correct.
+    - We compute the ratio inside this table and only keep the percentage.
 
-    We do NOT use this file for total population in the final dataset;
-    population comes from core figures instead.
+    Returns:
+    - gemeente_naam
+    - pct_migration_background (0–100)
     """
     df = safe_read_cbs_csv(path)
     df.columns = [c.strip().strip('"') for c in df.columns]
 
     col_regdesc = pick_first_matching_column(df.columns, ["Wijken en buurten"])
     col_gem = pick_first_matching_column(df.columns, ["Regioaanduiding/Gemeentenaam (naam)"])
+    col_pop = pick_first_matching_column(df.columns, ["Bevolking/Aantal inwoners (aantal)"])
     col_eu = pick_first_matching_column(df.columns, ["Herkomstland/Europa (exclusief Nederland)"])
-    col_non_eu = pick_first_matching_column(df.columns, ["Herkomstland/Buiten Europa"])
+    col_non_eu = pick_first_matching_column(df.columns, ["Herkomstland/Buiten Europa  (aantal)"])
 
-    if any(x is None for x in [col_regdesc, col_gem, col_eu, col_non_eu]):
+    if any(x is None for x in [col_regdesc, col_gem, col_pop, col_eu, col_non_eu]):
         raise ValueError("Could not find all required wijk/buurt columns.")
 
     df = add_gemeente_column(df, [col_gem])
 
-    # Clean region & gemeente strings properly
     region_clean = df[col_regdesc].astype(str).str.strip('"').str.strip()
     gem_clean = df[col_gem].astype(str).str.strip('"').str.strip()
 
+    # Remove NL total and gemeente-total rows
     mask_national = (region_clean == "Nederland") & (gem_clean == "Nederland")
     mask_gemeente_total = region_clean == gem_clean
 
     df_detail = df[~(mask_national | mask_gemeente_total)].copy()
 
-    df_detail["pop_migration_background"] = (
+    df_detail["pop_total_wb"] = pd.to_numeric(df_detail[col_pop], errors="coerce")
+    df_detail["pop_migration_wb"] = (
         pd.to_numeric(df_detail[col_eu], errors="coerce") +
         pd.to_numeric(df_detail[col_non_eu], errors="coerce")
     )
 
     grouped = df_detail.groupby("gemeente_naam", as_index=False).sum(numeric_only=True)
 
-    return grouped[["gemeente_naam", "pop_migration_background"]]
+    # Fraction and percentage (0–100); this % is correct even if raw counts are doubled
+    grouped["pct_migration_background"] = (
+        grouped["pop_migration_wb"] / grouped["pop_total_wb"].replace(0, np.nan) * 100
+    )
+
+    return grouped[["gemeente_naam", "pct_migration_background"]]
 
 
 def load_election_results(path: str, party_meta: pd.DataFrame) -> pd.DataFrame:
@@ -281,13 +285,11 @@ def load_election_results(path: str, party_meta: pd.DataFrame) -> pd.DataFrame:
         fill_value=0,
     )
 
-    # Total votes per gemeente
     votes_total = pivot_votes.sum(axis=1)
 
     # Shares in PERCENT (0–100)
     share_df = pivot_votes.div(votes_total.replace(0, np.nan), axis=0) * 100
 
-    # Result dataframe we'll return
     result = pd.DataFrame(index=share_df.index)
 
     # Per-party share columns
@@ -317,10 +319,13 @@ def load_election_results(path: str, party_meta: pd.DataFrame) -> pd.DataFrame:
             col_name = "mig_" + sanitize_name(cat) + "_share_pct"
             result[col_name] = share_df[parties_cat].sum(axis=1)
 
-    # Add votes_total (absolute)
     result["votes_total"] = votes_total
 
     return result.reset_index()
+
+
+# -------------------------------
+# Main
 
 
 def main():
@@ -344,11 +349,11 @@ def main():
     core = load_core_population(core_file)
     print("Core population shape:", core.shape)
 
-    print("Loading wijk/buurt migration aggregation...")
+    print("Loading wijk/buurt migration percentage...")
     wb = load_wijk_buurt(wb_file)
-    print("Wijk/buurt aggregated shape:", wb.shape)
+    print("Wijk/buurt migration shape:", wb.shape)
 
-    print("Loading election results and computing shares...")
+    print("Loading election results and computing party & bloc shares...")
     election = load_election_results(election_file, party_meta)
     print("Election shape:", election.shape)
 
@@ -357,11 +362,8 @@ def main():
     df = df.merge(wb, on="gemeente_naam", how="inner")
     df = df.merge(election, on="gemeente_naam", how="inner")
 
-    # Rename population column and compute migration percentage
+    # Rename population column
     df = df.rename(columns={"pop_total_core": "population"})
-    df["pct_migration_background"] = (
-        100 * df["pop_migration_background"] / df["population"].replace(0, np.nan)
-    )
 
     # Put key variables up front
     first_cols = [
@@ -370,7 +372,6 @@ def main():
         "num_households",
         "avg_income_household",
         "median_income_household",
-        "pop_migration_background",
         "pct_migration_background",
         "votes_total",
     ]
