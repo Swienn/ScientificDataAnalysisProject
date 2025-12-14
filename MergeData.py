@@ -174,25 +174,62 @@ def load_income(path: str) -> pd.DataFrame:
 
 def load_core_population(path: str) -> pd.DataFrame:
     """
-    Load CBS regional core figures and keep total population per gemeente.
+    Load CBS Regionale kerncijfers and keep:
+      - gemeente_naam
+      - pop_total_core (absolute population)
+      - age_*_pct columns (already percentages in CBS file)
+
+    IMPORTANT:
+    Age variables in this file are assumed to already be percentages (0–100).
+    They are NOT recomputed.
     """
     df = safe_read_cbs_csv(path)
     df.columns = [c.strip().strip('"') for c in df.columns]
 
     df = add_gemeente_column(df, ["Regio's", "Regio", "Gemeentenaam", "Gemeente"])
 
-    col_pop = pick_first_matching_column(
-        df.columns,
-        ["Totale bevolking (aantal)"]
-    )
+    # --- Total population (absolute) ---
+    col_pop = pick_first_matching_column(df.columns, ["Totale bevolking (aantal)"])
     if col_pop is None:
-        raise ValueError("Could not find population column in core figures CSV.")
+        raise ValueError("Could not find total population column in core figures CSV.")
 
     df["pop_total_core"] = pd.to_numeric(df[col_pop], errors="coerce")
 
-    df = df[df["pop_total_core"].notna()]
+    # --- Detect AGE PERCENTAGE columns ---
+    age_pct_cols = []
+    for c in df.columns:
+        cl = c.lower()
 
-    return df[["gemeente_naam", "pop_total_core"]]
+        # Typical CBS phrasing for percentages
+        if (
+            ("leeftijd" in cl or "jaar" in cl or "ouder" in cl)
+            and "%" in cl
+        ):
+            age_pct_cols.append(c)
+
+    if not age_pct_cols:
+        print("Warning: no age percentage columns detected in core figures.")
+
+    out = df[["gemeente_naam", "pop_total_core"] + age_pct_cols].copy()
+
+    # Ensure numeric
+    for c in age_pct_cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    # Rename age columns to stable names
+    rename_map = {
+        c: "age_" + sanitize_name(c) + "_pct"
+        for c in age_pct_cols
+    }
+    out = out.rename(columns=rename_map)
+
+    # Drop rows without population (filters non-gemeente rows)
+    out = out[out["pop_total_core"].notna()]
+
+    # Aggregate defensively
+    out = out.groupby("gemeente_naam", as_index=False).mean(numeric_only=True)
+
+    return out
 
 
 def load_wijk_buurt(path: str) -> pd.DataFrame:
