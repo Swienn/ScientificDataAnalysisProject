@@ -400,18 +400,6 @@ def main():
     print("\nDone! Saved:", output)
     print("Final shape:", df.shape)
     print(df.head())
-    
-    df = pd.read_csv("Data/merged_tk2025_dataset.csv")
-
-    econ_cols = [c for c in df.columns if c.startswith("econ_")]
-    mig_cols = [c for c in df.columns if c.startswith("mig_")]
-
-    print("Economic bloc sum:")
-    print((df[econ_cols].sum(axis=1)).describe())
-
-    print("Migration bloc sum:")
-    print((df[mig_cols].sum(axis=1)).describe())
-
 
 
 if __name__ == "__main__":
