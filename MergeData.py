@@ -177,11 +177,11 @@ def load_core_population(path: str) -> pd.DataFrame:
     Load CBS Regionale kerncijfers and keep:
       - gemeente_naam
       - pop_total_core (absolute population)
-      - age_*_pct columns (already percentages in CBS file)
+      - age_*_count columns (absolute counts per age group)
+      - age_*_pct columns (percentages per age group)
 
-    IMPORTANT:
-    Age variables in this file are assumed to already be percentages (0–100).
-    They are NOT recomputed.
+    NOTE:
+    We do NOT calculate anything ourselves here; we take the CBS values as-is.
     """
     df = safe_read_cbs_csv(path)
     df.columns = [c.strip().strip('"') for c in df.columns]
@@ -195,39 +195,46 @@ def load_core_population(path: str) -> pd.DataFrame:
 
     df["pop_total_core"] = pd.to_numeric(df[col_pop], errors="coerce")
 
-    # --- Detect AGE PERCENTAGE columns ---
+    # --- Detect AGE COUNT columns (aantal) ---
+    age_count_cols = []
+    for c in df.columns:
+        cl = c.lower()
+        if ("leeftijd" in cl or "jaar" in cl or "ouder" in cl) and "aantal" in cl:
+            age_count_cols.append(c)
+
+    # --- Detect AGE PERCENTAGE columns (%) ---
     age_pct_cols = []
     for c in df.columns:
         cl = c.lower()
-
-        # Typical CBS phrasing for percentages
-        if (
-            ("leeftijd" in cl or "jaar" in cl or "ouder" in cl)
-            and "%" in cl
-        ):
+        if ("leeftijd" in cl or "jaar" in cl or "ouder" in cl) and "%" in cl:
             age_pct_cols.append(c)
 
-    if not age_pct_cols:
-        print("Warning: no age percentage columns detected in core figures.")
+    if not age_count_cols and not age_pct_cols:
+        raise ValueError(
+            "Could not detect any age-group columns (counts or percentages) in core figures file."
+        )
 
-    out = df[["gemeente_naam", "pop_total_core"] + age_pct_cols].copy()
+    keep_cols = ["gemeente_naam", "pop_total_core"] + age_count_cols + age_pct_cols
+    out = df[keep_cols].copy()
 
-    # Ensure numeric
-    for c in age_pct_cols:
+    # Convert numeric columns
+    for c in age_count_cols + age_pct_cols:
         out[c] = pd.to_numeric(out[c], errors="coerce")
 
-    # Rename age columns to stable names
-    rename_map = {
-        c: "age_" + sanitize_name(c) + "_pct"
-        for c in age_pct_cols
-    }
+    # Rename to clean names
+    rename_map = {}
+    for c in age_count_cols:
+        rename_map[c] = "age_" + sanitize_name(c) + "_count"
+    for c in age_pct_cols:
+        rename_map[c] = "age_" + sanitize_name(c) + "_pct"
+
     out = out.rename(columns=rename_map)
 
-    # Drop rows without population (filters non-gemeente rows)
+    # Keep only rows with valid population (filters non-gemeente rows)
     out = out[out["pop_total_core"].notna()]
 
-    # Aggregate defensively
-    out = out.groupby("gemeente_naam", as_index=False).mean(numeric_only=True)
+    # Defensive aggregation (if duplicates exist)
+    out = out.groupby("gemeente_naam", as_index=False).sum(numeric_only=True)
 
     return out
 
@@ -396,9 +403,9 @@ def main():
     income = load_income(income_file)
     print("Income shape:", income.shape)
 
-    print("Loading core population...")
+    print("Loading core population + age groups (counts + percentages)...")
     core = load_core_population(core_file)
-    print("Core population shape:", core.shape)
+    print("Core shape:", core.shape)
 
     print("Loading wijk/buurt migration percentage...")
     wb = load_wijk_buurt(wb_file)
@@ -416,16 +423,20 @@ def main():
     # Rename population column
     df = df.rename(columns={"pop_total_core": "population"})
 
-    # Put key variables up front
+    # Put key variables up front (including all age columns from core)
+    age_cols = sorted([c for c in df.columns if c.startswith("age_")])
+
     first_cols = [
         "gemeente_naam",
         "population",
+    ] + age_cols + [
         "num_households",
         "avg_income_household",
         "median_income_household",
         "pct_migration_background",
         "votes_total",
     ]
+
     other_cols = [c for c in df.columns if c not in first_cols]
     df = df[first_cols + other_cols]
 
