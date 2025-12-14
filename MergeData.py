@@ -5,7 +5,7 @@ This version:
 - Uses only necessary CSV files:
     * Income per region (CBS)
     * Regional core figures (CBS)
-    * Wijk/buurt core figures (CBS) – ONLY for migration percentage
+    * Wijk/buurt core figures (CBS) - ONLY for migration percentage
     * Election results TK2025 per gemeente
     * PartyDistribution (to get parties with seats + economic & migration blocs)
 - Computes per gemeente:
@@ -13,7 +13,7 @@ This version:
     * num_households
     * avg_income_household (euros)
     * median_income_household (euros)
-    * pct_migration_background (percentage, 0–100; from wijk/buurt internal ratio)
+    * pct_migration_background (percentage, 0-100; from wijk/buurt internal ratio)
     * per-party vote shares in percent, columns: <PARTY>_share_pct
     * bloc vote shares in percent:
         - econ_<ECON_CATEGORY>_share_pct
@@ -251,16 +251,15 @@ def load_wijk_buurt(path: str) -> pd.DataFrame:
 def load_election_results(path: str, party_meta: pd.DataFrame) -> pd.DataFrame:
     """
     Load election results and:
-    - keep only parties that have seats (from PartyDistribution)
+    - include ALL parties in the election file
     - aggregate to gemeente level
     - compute:
-        * per-party vote shares in percent, columns: <PARTY>_share_pct
+        * per-party vote shares in percent: <PARTY>_share_pct
         * per economic bloc vote shares in percent: econ_<CAT>_share_pct
         * per migration bloc vote shares in percent: mig_<CAT>_share_pct
         * votes_total
     """
-    valid_parties = party_meta["party"].dropna().unique().tolist()
-
+    # Load election results
     df = pd.read_csv(
         path,
         sep=";",
@@ -272,11 +271,10 @@ def load_election_results(path: str, party_meta: pd.DataFrame) -> pd.DataFrame:
 
     df = add_gemeente_column(df, ["Gemeente"])
 
-    df = df[df["Partij"].isin(valid_parties)]
-
+    # Ensure numeric votes
     df["AantalStemmen"] = pd.to_numeric(df["AantalStemmen"], errors="coerce").fillna(0)
 
-    # Pivot to votes per party
+    # Pivot: votes per party per gemeente (ALL parties)
     pivot_votes = df.pivot_table(
         index="gemeente_naam",
         columns="Partij",
@@ -285,49 +283,65 @@ def load_election_results(path: str, party_meta: pd.DataFrame) -> pd.DataFrame:
         fill_value=0,
     )
 
+    # Total valid votes per gemeente
     votes_total = pivot_votes.sum(axis=1)
 
-    # Shares in PERCENT (0–100)
+    # Party vote shares in percent (0–100)
     share_df = pivot_votes.div(votes_total.replace(0, np.nan), axis=0) * 100
 
     result = pd.DataFrame(index=share_df.index)
 
-    # Per-party share columns
+    # --------------------------------------------------
+    # Per-party vote shares
+    # --------------------------------------------------
     for party in share_df.columns:
-        col_name = sanitize_name(party) + "_share_pct"
-        result[col_name] = share_df[party]
+        result[sanitize_name(party) + "_share_pct"] = share_df[party]
 
-    # Economic bloc shares
-    if "economic" in party_meta.columns:
-        econ_cats = party_meta["economic"].dropna().unique()
-        for cat in econ_cats:
-            parties_cat = party_meta.loc[party_meta["economic"] == cat, "party"]
-            parties_cat = [p for p in parties_cat if p in share_df.columns]
-            if not parties_cat:
-                continue
-            col_name = "econ_" + sanitize_name(cat) + "_share_pct"
-            result[col_name] = share_df[parties_cat].sum(axis=1)
+    # --------------------------------------------------
+    # Economic bloc vote shares
+    # --------------------------------------------------
+    party_to_econ = dict(
+        zip(party_meta["party"].astype(str), party_meta["economic"].astype(str))
+    )
 
-    # Migration bloc shares
-    if "migration" in party_meta.columns:
-        mig_cats = party_meta["migration"].dropna().unique()
-        for cat in mig_cats:
-            parties_cat = party_meta.loc[party_meta["migration"] == cat, "party"]
-            parties_cat = [p for p in parties_cat if p in share_df.columns]
-            if not parties_cat:
-                continue
-            col_name = "mig_" + sanitize_name(cat) + "_share_pct"
-            result[col_name] = share_df[parties_cat].sum(axis=1)
+    econ_cats = sorted(party_meta["economic"].dropna().unique())
 
+    for cat in econ_cats:
+        parties_cat = [
+            p for p in share_df.columns
+            if party_to_econ.get(p) == cat
+        ]
+        if not parties_cat:
+            continue
+
+        result["econ_" + sanitize_name(cat) + "_share_pct"] = share_df[parties_cat].sum(axis=1)
+
+    # --------------------------------------------------
+    # Migration bloc vote shares
+    # --------------------------------------------------
+    party_to_mig = dict(
+        zip(party_meta["party"].astype(str), party_meta["migration"].astype(str))
+    )
+
+    mig_cats = sorted(party_meta["migration"].dropna().unique())
+
+    for cat in mig_cats:
+        parties_cat = [
+            p for p in share_df.columns
+            if party_to_mig.get(p) == cat
+        ]
+        if not parties_cat:
+            continue
+
+        result["mig_" + sanitize_name(cat) + "_share_pct"] = share_df[parties_cat].sum(axis=1)
+
+    # Add total votes
     result["votes_total"] = votes_total
 
     return result.reset_index()
 
 
-# -------------------------------
 # Main
-
-
 def main():
     data_dir = "Data"
 
@@ -337,9 +351,9 @@ def main():
     party_file = os.path.join(data_dir, "PartyDistribution.csv")
     election_file = os.path.join(data_dir, "uitslag_TK20251029_Gemeente.csv")
 
-    print("Loading party metadata (parties with seats + blocs)...")
+    print("Loading party metadata...")
     party_meta = load_party_meta(party_file)
-    print("Parties with seats:", party_meta["party"].unique())
+    print("Parties", party_meta["party"].unique())
 
     print("Loading income data...")
     income = load_income(income_file)
@@ -386,6 +400,18 @@ def main():
     print("\nDone! Saved:", output)
     print("Final shape:", df.shape)
     print(df.head())
+    
+    df = pd.read_csv("Data/merged_tk2025_dataset.csv")
+
+    econ_cols = [c for c in df.columns if c.startswith("econ_")]
+    mig_cols = [c for c in df.columns if c.startswith("mig_")]
+
+    print("Economic bloc sum:")
+    print((df[econ_cols].sum(axis=1)).describe())
+
+    print("Migration bloc sum:")
+    print((df[mig_cols].sum(axis=1)).describe())
+
 
 
 if __name__ == "__main__":
