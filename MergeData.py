@@ -5,7 +5,7 @@ This version:
 - Uses only necessary CSV files:
     * Income per region (CBS)
     * Regional core figures (CBS)
-    * Wijk/buurt core figures (CBS) – ONLY for migration percentage
+    * Wijk/buurt core figures (CBS) - ONLY for migration percentage
     * Election results TK2025 per gemeente
     * PartyDistribution (to get parties with seats + economic & migration blocs)
 - Computes per gemeente:
@@ -13,7 +13,7 @@ This version:
     * num_households
     * avg_income_household (euros)
     * median_income_household (euros)
-    * pct_migration_background (percentage, 0–100; from wijk/buurt internal ratio)
+    * pct_migration_background (percentage, 0-100; from wijk/buurt internal ratio)
     * per-party vote shares in percent, columns: <PARTY>_share_pct
     * bloc vote shares in percent:
         - econ_<ECON_CATEGORY>_share_pct
@@ -174,25 +174,69 @@ def load_income(path: str) -> pd.DataFrame:
 
 def load_core_population(path: str) -> pd.DataFrame:
     """
-    Load CBS regional core figures and keep total population per gemeente.
+    Load CBS Regionale kerncijfers and keep:
+      - gemeente_naam
+      - pop_total_core (absolute population)
+      - age_*_count columns (absolute counts per age group)
+      - age_*_pct columns (percentages per age group)
+
+    NOTE:
+    We do NOT calculate anything ourselves here; we take the CBS values as-is.
     """
     df = safe_read_cbs_csv(path)
     df.columns = [c.strip().strip('"') for c in df.columns]
 
     df = add_gemeente_column(df, ["Regio's", "Regio", "Gemeentenaam", "Gemeente"])
 
-    col_pop = pick_first_matching_column(
-        df.columns,
-        ["Totale bevolking (aantal)"]
-    )
+    # --- Total population (absolute) ---
+    col_pop = pick_first_matching_column(df.columns, ["Totale bevolking (aantal)"])
     if col_pop is None:
-        raise ValueError("Could not find population column in core figures CSV.")
+        raise ValueError("Could not find total population column in core figures CSV.")
 
     df["pop_total_core"] = pd.to_numeric(df[col_pop], errors="coerce")
 
-    df = df[df["pop_total_core"].notna()]
+    # --- Detect AGE COUNT columns (aantal) ---
+    age_count_cols = []
+    for c in df.columns:
+        cl = c.lower()
+        if ("leeftijd" in cl or "jaar" in cl or "ouder" in cl) and "aantal" in cl:
+            age_count_cols.append(c)
 
-    return df[["gemeente_naam", "pop_total_core"]]
+    # --- Detect AGE PERCENTAGE columns (%) ---
+    age_pct_cols = []
+    for c in df.columns:
+        cl = c.lower()
+        if ("leeftijd" in cl or "jaar" in cl or "ouder" in cl) and "%" in cl:
+            age_pct_cols.append(c)
+
+    if not age_count_cols and not age_pct_cols:
+        raise ValueError(
+            "Could not detect any age-group columns (counts or percentages) in core figures file."
+        )
+
+    keep_cols = ["gemeente_naam", "pop_total_core"] + age_count_cols + age_pct_cols
+    out = df[keep_cols].copy()
+
+    # Convert numeric columns
+    for c in age_count_cols + age_pct_cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    # Rename to clean names
+    rename_map = {}
+    for c in age_count_cols:
+        rename_map[c] = "age_" + sanitize_name(c) + "_count"
+    for c in age_pct_cols:
+        rename_map[c] = "age_" + sanitize_name(c) + "_pct"
+
+    out = out.rename(columns=rename_map)
+
+    # Keep only rows with valid population (filters non-gemeente rows)
+    out = out[out["pop_total_core"].notna()]
+
+    # Defensive aggregation (if duplicates exist)
+    out = out.groupby("gemeente_naam", as_index=False).sum(numeric_only=True)
+
+    return out
 
 
 def load_wijk_buurt(path: str) -> pd.DataFrame:
@@ -251,16 +295,15 @@ def load_wijk_buurt(path: str) -> pd.DataFrame:
 def load_election_results(path: str, party_meta: pd.DataFrame) -> pd.DataFrame:
     """
     Load election results and:
-    - keep only parties that have seats (from PartyDistribution)
+    - include ALL parties in the election file
     - aggregate to gemeente level
     - compute:
-        * per-party vote shares in percent, columns: <PARTY>_share_pct
+        * per-party vote shares in percent: <PARTY>_share_pct
         * per economic bloc vote shares in percent: econ_<CAT>_share_pct
         * per migration bloc vote shares in percent: mig_<CAT>_share_pct
         * votes_total
     """
-    valid_parties = party_meta["party"].dropna().unique().tolist()
-
+    # Load election results
     df = pd.read_csv(
         path,
         sep=";",
@@ -272,11 +315,10 @@ def load_election_results(path: str, party_meta: pd.DataFrame) -> pd.DataFrame:
 
     df = add_gemeente_column(df, ["Gemeente"])
 
-    df = df[df["Partij"].isin(valid_parties)]
-
+    # Ensure numeric votes
     df["AantalStemmen"] = pd.to_numeric(df["AantalStemmen"], errors="coerce").fillna(0)
 
-    # Pivot to votes per party
+    # Pivot: votes per party per gemeente (ALL parties)
     pivot_votes = df.pivot_table(
         index="gemeente_naam",
         columns="Partij",
@@ -285,49 +327,65 @@ def load_election_results(path: str, party_meta: pd.DataFrame) -> pd.DataFrame:
         fill_value=0,
     )
 
+    # Total valid votes per gemeente
     votes_total = pivot_votes.sum(axis=1)
 
-    # Shares in PERCENT (0–100)
+    # Party vote shares in percent (0–100)
     share_df = pivot_votes.div(votes_total.replace(0, np.nan), axis=0) * 100
 
     result = pd.DataFrame(index=share_df.index)
 
-    # Per-party share columns
+    # --------------------------------------------------
+    # Per-party vote shares
+    # --------------------------------------------------
     for party in share_df.columns:
-        col_name = sanitize_name(party) + "_share_pct"
-        result[col_name] = share_df[party]
+        result[sanitize_name(party) + "_share_pct"] = share_df[party]
 
-    # Economic bloc shares
-    if "economic" in party_meta.columns:
-        econ_cats = party_meta["economic"].dropna().unique()
-        for cat in econ_cats:
-            parties_cat = party_meta.loc[party_meta["economic"] == cat, "party"]
-            parties_cat = [p for p in parties_cat if p in share_df.columns]
-            if not parties_cat:
-                continue
-            col_name = "econ_" + sanitize_name(cat) + "_share_pct"
-            result[col_name] = share_df[parties_cat].sum(axis=1)
+    # --------------------------------------------------
+    # Economic bloc vote shares
+    # --------------------------------------------------
+    party_to_econ = dict(
+        zip(party_meta["party"].astype(str), party_meta["economic"].astype(str))
+    )
 
-    # Migration bloc shares
-    if "migration" in party_meta.columns:
-        mig_cats = party_meta["migration"].dropna().unique()
-        for cat in mig_cats:
-            parties_cat = party_meta.loc[party_meta["migration"] == cat, "party"]
-            parties_cat = [p for p in parties_cat if p in share_df.columns]
-            if not parties_cat:
-                continue
-            col_name = "mig_" + sanitize_name(cat) + "_share_pct"
-            result[col_name] = share_df[parties_cat].sum(axis=1)
+    econ_cats = sorted(party_meta["economic"].dropna().unique())
 
+    for cat in econ_cats:
+        parties_cat = [
+            p for p in share_df.columns
+            if party_to_econ.get(p) == cat
+        ]
+        if not parties_cat:
+            continue
+
+        result["econ_" + sanitize_name(cat) + "_share_pct"] = share_df[parties_cat].sum(axis=1)
+
+    # --------------------------------------------------
+    # Migration bloc vote shares
+    # --------------------------------------------------
+    party_to_mig = dict(
+        zip(party_meta["party"].astype(str), party_meta["migration"].astype(str))
+    )
+
+    mig_cats = sorted(party_meta["migration"].dropna().unique())
+
+    for cat in mig_cats:
+        parties_cat = [
+            p for p in share_df.columns
+            if party_to_mig.get(p) == cat
+        ]
+        if not parties_cat:
+            continue
+
+        result["mig_" + sanitize_name(cat) + "_share_pct"] = share_df[parties_cat].sum(axis=1)
+
+    # Add total votes
     result["votes_total"] = votes_total
 
     return result.reset_index()
 
 
-# -------------------------------
 # Main
-
-
 def main():
     data_dir = "Data"
 
@@ -337,17 +395,17 @@ def main():
     party_file = os.path.join(data_dir, "PartyDistribution.csv")
     election_file = os.path.join(data_dir, "uitslag_TK20251029_Gemeente.csv")
 
-    print("Loading party metadata (parties with seats + blocs)...")
+    print("Loading party metadata...")
     party_meta = load_party_meta(party_file)
-    print("Parties with seats:", party_meta["party"].unique())
+    print("Parties", party_meta["party"].unique())
 
     print("Loading income data...")
     income = load_income(income_file)
     print("Income shape:", income.shape)
 
-    print("Loading core population...")
+    print("Loading core population + age groups (counts + percentages)...")
     core = load_core_population(core_file)
-    print("Core population shape:", core.shape)
+    print("Core shape:", core.shape)
 
     print("Loading wijk/buurt migration percentage...")
     wb = load_wijk_buurt(wb_file)
@@ -365,16 +423,20 @@ def main():
     # Rename population column
     df = df.rename(columns={"pop_total_core": "population"})
 
-    # Put key variables up front
+    # Put key variables up front (including all age columns from core)
+    age_cols = sorted([c for c in df.columns if c.startswith("age_")])
+
     first_cols = [
         "gemeente_naam",
         "population",
+    ] + age_cols + [
         "num_households",
         "avg_income_household",
         "median_income_household",
         "pct_migration_background",
         "votes_total",
     ]
+
     other_cols = [c for c in df.columns if c not in first_cols]
     df = df[first_cols + other_cols]
 
