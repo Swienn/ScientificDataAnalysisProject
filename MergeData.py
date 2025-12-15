@@ -4,6 +4,7 @@ Create a municipality-level dataset for TK 2025 voting behavior analysis.
 This version:
 - Uses only necessary CSV files:
     * Income per region (CBS)
+    * Gender per region (CBS)
     * Regional core figures (CBS)
     * Wijk/buurt core figures (CBS) - ONLY for migration percentage
     * Election results TK2025 per gemeente
@@ -239,6 +240,50 @@ def load_core_population(path: str) -> pd.DataFrame:
     return out
 
 
+def load_genders(path: str) -> pd.DataFrame:
+    """
+    Load CBS Regionale kerncijfers and keep:
+      - gemeente_naam
+      - men_count
+      - women_count
+
+    NOTE:
+    We do NOT calculate anything ourselves here; we take the CBS values as-is.
+    """
+    df = safe_read_cbs_csv(path)
+    df.columns = [c.strip().strip('"') for c in df.columns]
+
+    col_regdesc = pick_first_matching_column(df.columns, ["Wijken en buurten"])
+    col_gem = pick_first_matching_column(df.columns, ["Regioaanduiding/Gemeentenaam (naam)"])
+    col_men = pick_first_matching_column(df.columns, ["Bevolking/Geslacht/Mannen (aantal)"])
+    col_women = pick_first_matching_column(df.columns, ["Bevolking/Geslacht/Vrouwen (aantal)"])
+
+    if any(x is None for x in [col_regdesc, col_gem, col_men]):
+        raise ValueError("Missing required genders columns in file.")
+
+    df = add_gemeente_column(df, [col_gem])
+
+    region_clean = df[col_regdesc].astype(str).str.strip('"').str.strip()
+    gem_clean = df[col_gem].astype(str).str.strip('"').str.strip()
+
+    # Keep ONLY the gemeente-total rows, drop national total
+    mask_national = (region_clean == "Nederland") & (gem_clean == "Nederland")
+    mask_gemeente_total = (region_clean == gem_clean)
+    df_gem = df[mask_gemeente_total & ~mask_national].copy()
+
+    # Parse numerics
+    df_gem["men_count"] = pd.to_numeric(df_gem[col_men], errors="coerce")
+    df_gem["women_count"] = pd.to_numeric(df_gem[col_women], errors="coerce")
+
+    keep_cols = ["gemeente_naam", "men_count", "women_count"]
+    out = df_gem[keep_cols].copy()
+
+    # If there are duplicate gemeente rows, keep the first (they should be unique after filtering)
+    out = out.drop_duplicates(subset=["gemeente_naam"], keep="first")
+
+    return out
+
+
 def load_wijk_buurt(path: str) -> pd.DataFrame:
     """
     Load wijk/buurt file and compute *percentage* with migration background per gemeente.
@@ -392,6 +437,7 @@ def main():
     income_file = os.path.join(data_dir, "Inkomen_van_huishoudens__regio_11122025_135329.csv")
     core_file = os.path.join(data_dir, "Regionale_kerncijfers_Nederland_11122025_133649.csv")
     wb_file = os.path.join(data_dir, "Kerncijfers_wijken_en_buurten_2024_11122025_141648.csv")
+    genders_file = os.path.join(data_dir, "Kerncijfers_wijken_en_buurten_2024_geslachten.csv")
     party_file = os.path.join(data_dir, "PartyDistribution.csv")
     election_file = os.path.join(data_dir, "uitslag_TK20251029_Gemeente.csv")
 
@@ -411,12 +457,17 @@ def main():
     wb = load_wijk_buurt(wb_file)
     print("Wijk/buurt migration shape:", wb.shape)
 
+    print("Loading genders population...")
+    gend = load_genders(genders_file)
+    print("Genders shape:", gend.shape)
+
     print("Loading election results and computing party & bloc shares...")
     election = load_election_results(election_file, party_meta)
     print("Election shape:", election.shape)
 
     print("Merging datasets...")
     df = income.merge(core, on="gemeente_naam", how="inner")
+    df = df.merge(gend, on="gemeente_naam", how="inner")
     df = df.merge(wb, on="gemeente_naam", how="inner")
     df = df.merge(election, on="gemeente_naam", how="inner")
 
