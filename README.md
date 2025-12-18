@@ -1,6 +1,6 @@
 # Scientific Data Analysis Project
 
-Small repository for preparing a municipality level dataset for analysis of the 2025 Dutch parliamentary election (TK2025).
+Repository for preparing a municipality level dataset and analysis of the 2025 Dutch parliamentary election (TK2025).
 
 ## Purpose
 This project combines multiple CBS and election CSV files to create a single municipality-level dataset (`Data/merged_tk2025_dataset.csv`) containing demographic variables, income statistics, migration background percentages, per-party vote shares, and bloc vote shares.
@@ -49,7 +49,7 @@ Scientific Data Analysis
 
 This repository includes a Jupyter notebook `analysis.ipynb` that demonstrates exploratory analysis and plotting on the merged dataset.
 
-- Location: `analysis.ipynb` (top-level)
+- Location: `analysis.ipynb`
 - Execution state: cells in this notebook are currently not executed in the repository snapshot. Some cells contain output images and text but the notebook should be re-run locally to regenerate outputs.
 - Purpose: quick EDA and visual checks of the final `Data/merged_tk2025_dataset.csv` (distribution of bloc shares, maps/plots, and sanity checks).
 - How to run: open the notebook in Jupyter or VS Code and run all cells after installing the project dependencies (`pandas`, `numpy`, and any plotting libraries you need such as `matplotlib` or `plotly`).
