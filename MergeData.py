@@ -296,7 +296,7 @@ def load_wijk_buurt(path: str) -> pd.DataFrame:
 
     Returns:
     - gemeente_naam
-    - pct_migration_background (0–100)
+    - pct_migration_background (0-100)
     """
     df = safe_read_cbs_csv(path)
     df.columns = [c.strip().strip('"') for c in df.columns]
